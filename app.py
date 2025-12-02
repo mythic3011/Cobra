@@ -10,12 +10,16 @@ import sys
 import time
 import itertools
 import copy
+import warnings
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+
+# Suppress FutureWarning about torch.load weights_only parameter
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*torch.load.*weights_only.*')
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import Dataset
@@ -57,6 +61,13 @@ from diffusers import (
 from cobra_utils.utils import *
 
 from huggingface_hub import snapshot_download
+
+# Import batch processing UI
+from batch_ui import create_batch_processing_ui
+
+# Set device to MPS if available, otherwise CPU
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
 
 model_global_path = snapshot_download(repo_id="JunhaoZhuang/Cobra", cache_dir='./Cobra/', repo_type="model")
 print(model_global_path)
@@ -160,17 +171,18 @@ weight_dtype = torch.float16
 # line model
 line_model_path = os.path.join(model_global_path, 'LE', 'erika.pth')
 line_model = res_skip()
-line_model.load_state_dict(torch.load(line_model_path))
+line_model.load_state_dict(torch.load(line_model_path, map_location=device))
 line_model.eval()
-line_model.cuda()
+line_model.to(device)
 
 
 # image encoder
 image_processor = CLIPImageProcessor()
-image_encoder = CLIPVisionModelWithProjection.from_pretrained(os.path.join(model_global_path, 'image_encoder')).to('cuda')
+image_encoder = CLIPVisionModelWithProjection.from_pretrained(os.path.join(model_global_path, 'image_encoder')).to(device)
 
 
 
+# Global model instances - shared between single image and batch processing modes
 global pipeline
 global MultiResNetModel
 
@@ -183,8 +195,8 @@ def load_ckpt():
 
     block_out_channels = [128, 128, 256, 512, 512]
     MultiResNetModel = MultiHiddenResNetModel(block_out_channels, len(block_out_channels))
-    MultiResNetModel.load_state_dict(torch.load(os.path.join(model_global_path, 'shadow_GSRP', 'MultiResNetModel.bin'), map_location='cpu'), strict=True)
-    MultiResNetModel.to('cuda', dtype=weight_dtype)
+    MultiResNetModel.load_state_dict(torch.load(os.path.join(model_global_path, 'shadow_GSRP', 'MultiResNetModel.bin'), map_location=device), strict=True)
+    MultiResNetModel.to(device, dtype=weight_dtype)
 
 
     # transformer
@@ -266,13 +278,13 @@ def load_ckpt():
     causal_dit.add_adapter(transformer_lora_config)
 
     
-    lora_state_dict = torch.load(os.path.join(model_global_path, 'shadow_ckpt', 'transformer_lora_pos.bin'), map_location='cpu')
+    lora_state_dict = torch.load(os.path.join(model_global_path, 'shadow_ckpt', 'transformer_lora_pos.bin'), map_location=device)
     causal_dit.load_state_dict(lora_state_dict, strict=False)
-    controlnet_state_dict = torch.load(os.path.join(model_global_path, 'shadow_ckpt', 'controlnet.bin'), map_location='cpu')
+    controlnet_state_dict = torch.load(os.path.join(model_global_path, 'shadow_ckpt', 'controlnet.bin'), map_location=device)
     controlnet.load_state_dict(controlnet_state_dict, strict=True)
 
-    causal_dit.to('cuda', dtype=weight_dtype)
-    controlnet.to('cuda', dtype=weight_dtype)
+    causal_dit.to(device, dtype=weight_dtype)
+    controlnet.to(device, dtype=weight_dtype)
 
     pipeline = CobraPixArtAlphaPipeline.from_pretrained(
             pretrained_model_name_or_path,
@@ -284,7 +296,7 @@ def load_ckpt():
             torch_dtype=weight_dtype,
         )
 
-    pipeline = pipeline.to("cuda")
+    pipeline = pipeline.to(device)
     
 global cur_style
 cur_style = 'line + shadow'
@@ -307,17 +319,17 @@ def change_ckpt(style):
 
     cur_style = style
 
-    MultiResNetModel.load_state_dict(torch.load(MultiResNetModel_path, map_location='cpu'), strict=True)
-    MultiResNetModel.to('cuda', dtype=weight_dtype)
+    MultiResNetModel.load_state_dict(torch.load(MultiResNetModel_path, map_location=device), strict=True)
+    MultiResNetModel.to(device, dtype=weight_dtype)
 
 
-    lora_state_dict = torch.load(causal_dit_lora_path, map_location='cpu')
+    lora_state_dict = torch.load(causal_dit_lora_path, map_location=device)
     pipeline.transformer.load_state_dict(lora_state_dict, strict=False)
-    controlnet_state_dict = torch.load(controlnet_path, map_location='cpu')
+    controlnet_state_dict = torch.load(controlnet_path, map_location=device)
     pipeline.controlnet.load_state_dict(controlnet_state_dict, strict=True)
 
-    pipeline.transformer.to('cuda', dtype=weight_dtype)
-    pipeline.controlnet.to('cuda', dtype=weight_dtype)
+    pipeline.transformer.to(device, dtype=weight_dtype)
+    pipeline.controlnet.to(device, dtype=weight_dtype)
 
     print('loaded {} ckpt'.format(style))
 
@@ -331,9 +343,11 @@ def fix_random_seeds(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+    elif device.type == "mps":
+        torch.mps.manual_seed(seed)
 
 def process_multi_images(files):
     images = [Image.open(file.name) for file in files]
@@ -351,7 +365,7 @@ def extract_lines(image):
     patch = np.ones((1, 1, rows, cols), dtype="float32")
     patch[0, 0, 0:src.shape[0], 0:src.shape[1]] = src
 
-    tensor = torch.from_numpy(patch).cuda()
+    tensor = torch.from_numpy(patch).to(device)
 
     with torch.no_grad():
         y = line_model(tensor)
@@ -363,7 +377,10 @@ def extract_lines(image):
     outimg = yc[0:src.shape[0], 0:src.shape[1]]
     outimg = outimg.astype(np.uint8)
     outimg = Image.fromarray(outimg)
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
     return outimg
 
 def extract_line_image(query_image_, resolution):
@@ -372,7 +389,10 @@ def extract_line_image(query_image_, resolution):
     query_image = query_image.convert('L').convert('RGB')
     extracted_line = extract_lines(query_image)
     extracted_line = extracted_line.convert('L').convert('RGB')
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
     return extracted_line, Image.new('RGB', (tar_width, tar_height), 'black')
 
 def extract_sketch_line_image(query_image_, input_style):
@@ -434,10 +454,10 @@ def colorize_image(extracted_line, reference_images, resolution, seed, num_infer
     for reference_image in reference_images:
         reference_patches_pil += process_image_ref_varres(reference_image, tar_width, tar_height)
     with torch.no_grad():
-        clip_img = image_processor(images=query_patches_pil, return_tensors="pt").pixel_values.to(image_encoder.device, dtype=image_encoder.dtype)
+        clip_img = image_processor(images=query_patches_pil, return_tensors="pt").pixel_values.to(device, dtype=image_encoder.dtype)
         query_embeddings = image_encoder(clip_img).image_embeds
         reference_patches_pil_gray = [rimg.convert('RGB').convert('RGB') for rimg in reference_patches_pil]
-        clip_img = image_processor(images=reference_patches_pil_gray, return_tensors="pt").pixel_values.to(image_encoder.device, dtype=image_encoder.dtype)
+        clip_img = image_processor(images=reference_patches_pil_gray, return_tensors="pt").pixel_values.to(device, dtype=image_encoder.dtype)
         reference_embeddings = image_encoder(clip_img).image_embeds
         cosine_similarities = F.cosine_similarity(query_embeddings.unsqueeze(1), reference_embeddings.unsqueeze(0), dim=-1)
         len_ref = len(reference_patches_pil)
@@ -463,7 +483,7 @@ def colorize_image(extracted_line, reference_images, resolution, seed, num_infer
     draw.text((0, 0), "Reference Images", fill='red', font_size=50)
 
     gr.Info("Model inference in progress...")
-    generator = torch.Generator(device='cuda').manual_seed(seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
     hint_mask = hint_mask.resize((tar_width//8, tar_height//8)).convert('RGB')
     hint_color = hint_color.convert('RGB')
     
@@ -478,8 +498,8 @@ def colorize_image(extracted_line, reference_images, resolution, seed, num_infer
     gr.Info("Post-processing image...")
     with torch.no_grad():
         up_img = colorized_image.resize(query_image_vae.size)
-        test_low_color = transform(up_img).unsqueeze(0).to('cuda', dtype=weight_dtype)
-        query_image_vae_ = transform(query_image_vae).unsqueeze(0).to('cuda', dtype=weight_dtype)
+        test_low_color = transform(up_img).unsqueeze(0).to(device, dtype=weight_dtype)
+        query_image_vae_ = transform(query_image_vae).unsqueeze(0).to(device, dtype=weight_dtype)
 
         h_color, hidden_list_color = pipeline.vae._encode(test_low_color,return_dict = False, hidden_flag = True)
         h_bw, hidden_list_bw = pipeline.vae._encode(query_image_vae_, return_dict = False, hidden_flag = True)
@@ -494,7 +514,10 @@ def colorize_image(extracted_line, reference_images, resolution, seed, num_infer
         output[output < -1] = -1
         high_res_image = Image.fromarray(((output[0] * 0.5 + 0.5).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)).convert("RGB")
     gr.Info("Colorization complete!")
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
     
     output_gallery = [high_res_image, query_image_bw, hint_mask, hint_color, grid_img] 
     return output_gallery
@@ -530,22 +553,17 @@ def draw_square(line_drawing_image_pil, hint_mask, color_value, evt: gr.SelectDa
     return line_drawing_image_pil, hint_mask_pil
 
 
-with gr.Blocks() as demo:
+def create_single_image_ui():
+    """Create the single image colorization UI."""
     gr.HTML(
     """
 <div style="text-align: center;">
-    <h1 style="text-align: center; font-size: 3em;">🎨 Cobra:</h1>
-    <h3 style="text-align: center; font-size: 1.8em;">Efficient Line Art COlorization with BRoAder References</h3>
-    <p style="text-align: center; font-weight: bold;">
-        <a href="https://zhuang2002.github.io/Cobra/">Project Page</a> | 
-        <a href="https://arxiv.org">ArXiv Preprint</a> | 
-        <a href="https://github.com/zhuang2002/Cobra">GitHub Repository</a>
-    </p>
+    <h2 style="text-align: center; font-size: 2em;">Single Image Colorization</h2>
     <p style="text-align: center; font-weight: bold;">
         NOTE: Each time you switch the input style, the corresponding model will be reloaded, which may take some time. Please be patient.
     </p>
     <p style="text-align: left; font-size: 1.1em;">
-        Welcome to the demo of <strong>Cobra</strong>. Follow the steps below to explore the capabilities of our model:
+        Follow the steps below to colorize a single image:
     </p>
 </div>
 <div style="text-align: left; margin: 0 auto;">
@@ -558,9 +576,6 @@ with gr.Blocks() as demo:
         <li>(Optional) Set inference parameters: Adjust the inference settings as needed.</li>
         <li>Run: Click the <b>Colorize</b> button to start the process.</li>
     </ol>
-    <p>
-        ⏱️ <b>ZeroGPU Time Limit</b>: Hugging Face ZeroGPU has an inference time limit of 180 seconds. You may need to log in with a free account to use this demo. Large sampling steps might lead to timeout (GPU Abort). In that case, please consider logging in with a Pro account or running it on your local machine.
-    </p>
 </div>
 <div style="text-align: center;">
     <p style="text-align: center; font-weight: bold;">
@@ -573,16 +588,13 @@ with gr.Blocks() as demo:
 <div style="text-align: left; margin: 0 auto;">
     <ol style="font-size: 1.1em;">
         <li>选择输入样式：线条+阴影或仅线条。</li>
-        <li>上传您的图像：点击“上传”按钮选择您想要上色的图像。</li>
-        <li>预处理图像：点击“预处理”按钮从您的图像中提取线稿。</li>
+        <li>上传您的图像：点击"上传"按钮选择您想要上色的图像。</li>
+        <li>预处理图像：点击"预处理"按钮从您的图像中提取线稿。</li>
         <li>（可选）获取颜色值并添加颜色提示：上传一张图像到左侧区域，点击获取颜色值；然后，为右侧的线稿添加颜色提示。</li>
         <li>上传参考图像：上传多个参考图像以帮助引导上色过程。</li>
         <li>（可选）设置推理参数：根据需要调整推理设置。</li>
         <li>运行：点击 <b>上色</b> 按钮开始处理。</li>
     </ol>
-    <p>
-        ⏱️ <b>ZeroGPU时间限制</b>：Hugging Face ZeroGPU 的推理时间限制为 180 秒。您可能需要使用免费帐户登录以使用此演示。大采样步骤可能会导致超时（GPU 中止）。在这种情况下，请考虑使用专业帐户登录或在本地计算机上运行。
-    </p>
 </div>
     """
 )
@@ -666,6 +678,52 @@ with gr.Blocks() as demo:
             label="Examples",
             examples_per_page=8,
         )
+
+
+# Main application with unified interface
+# - Shared resources: pipeline, MultiResNetModel, line_model, image_encoder (loaded globally)
+# - State isolation: Each tab maintains its own state variables (gr.State objects)
+# - Tab switching preserves state within each tab independently
+# - Consistent styling: Same color scheme, fonts, and spacing across both tabs
+with gr.Blocks(
+    title="Cobra - Line Art Colorization",
+    css="""
+        .gradio-container {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+        }
+        .gr-button-primary {
+            background-color: #3498db !important;
+        }
+        .gr-button-primary:hover {
+            background-color: #2980b9 !important;
+        }
+    """
+) as demo:
+    gr.HTML(
+    """
+<div style="text-align: center;">
+    <h1 style="text-align: center; font-size: 3em;">🎨 Cobra</h1>
+    <h3 style="text-align: center; font-size: 1.8em;">Efficient Line Art COlorization with BRoAder References</h3>
+    <p style="text-align: left; font-size: 1.1em;">
+        Welcome to <strong>Cobra</strong>. Choose between single image or batch processing modes below.
+    </p>
+</div>
+    """
+    )
+    
+    with gr.Tabs():
+        # Tab 1: Single Image Processing
+        # State: hint_mask, hint_color, query_image_origin, resolution, extracted_image_ori, style
+        with gr.TabItem("Single Image"):
+            create_single_image_ui()
+        
+        # Tab 2: Batch Processing
+        # State: batch_processor, temp_extract_dir, detected_line_art, detected_references (in batch_ui.py)
+        with gr.TabItem("Batch Processing"):
+            create_batch_processing_ui()
 
 
 demo.launch()
